@@ -34,6 +34,18 @@ Use regex matching:
 uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout list --regex 'review|worker' --view ops
 ```
 
+Use full-text matching across raw session JSONL:
+
+```bash
+uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout list --source all --fulltext 'codex-plugin-session-repair-2026-03-21.md' --columns id,title
+```
+
+Use regex matching across raw session JSONL:
+
+```bash
+uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout list --source all --fulltext-regex 'Update File: .*codex-plugin-session-repair' --columns id,title
+```
+
 Fetch one session:
 
 ```bash
@@ -44,8 +56,9 @@ uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout fetch <s
 
 1. Start with `list --view ops --active-within 24h` when the user wants a live operational view.
 2. Add `--query` or `--regex` when the session list is noisy.
-3. Use `fetch <session-id>` when the user asks what a session is doing or what it did last.
-4. Summarize the relevant recent events instead of dumping the entire log unless the user asks for raw output.
+3. Add `--fulltext` or `--fulltext-regex` when you need to search session content, not just title/id metadata.
+4. Use `fetch <session-id>` when the user asks what a session is doing or what it did last.
+5. Summarize the relevant recent events instead of dumping the entire log unless the user asks for raw output.
 
 ## Notes
 

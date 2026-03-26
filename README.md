@@ -12,6 +12,7 @@ It is built for the moments when the normal picker is too slow or too visual: fi
 - Sorts active sessions to the top using recent file activity
 - Shows compact operational views with `live age`, `age`, and derived `status`
 - Filters by substring or grep-style regex against thread name, preview, or session id
+- Supports full-text and regex search inside the full JSONL session stream
 - Fetches the full JSONL or JSON payload for any session id
 
 ## CLI Design
@@ -85,6 +86,18 @@ Emit structured JSON for automation:
 
 ```bash
 uv run ./codex-session-scout list --source all --status running --format json
+```
+
+Full-text search inside session content:
+
+```bash
+uv run ./codex-session-scout list --source all --fulltext 'codex-plugin-session-repair-2026-03-21.md' --columns live,age,status,id,title
+```
+
+Regex search inside session content:
+
+```bash
+uv run ./codex-session-scout list --source all --fulltext-regex 'Add File: .*codex-plugin-session-repair' --columns id,title
 ```
 
 ## Status Model

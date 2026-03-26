@@ -8,6 +8,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import deque
@@ -15,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 DEFAULT_SESSIONS_DIR = "/root/.codex/sessions"
 DEFAULT_ARCHIVED_DIR = "/root/.codex/archived_sessions"
@@ -338,6 +339,92 @@ def matches_query(record: dict, query: str | None, regexes: list[re.Pattern[str]
     return True
 
 
+def session_text_matches(
+    path: Path,
+    fulltext_query: str | None,
+    fulltext_regexes: list[re.Pattern[str]],
+) -> bool:
+    if not fulltext_query and not fulltext_regexes:
+        return True
+
+    query_norm = fulltext_query.casefold() if fulltext_query else None
+    query_hit = query_norm is None
+    regex_hit = not fulltext_regexes
+
+    try:
+        with open_session_text(path) as f:
+            for line in f:
+                if not query_hit and query_norm and query_norm in line.casefold():
+                    query_hit = True
+                if not regex_hit and any(pattern.search(line) for pattern in fulltext_regexes):
+                    regex_hit = True
+                if query_hit and regex_hit:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def rg_file_matches(
+    source_roots: list[tuple[str, Path]],
+    fulltext_query: str | None,
+    fulltext_regexes: list[re.Pattern[str]],
+) -> set[Path] | None:
+    if not fulltext_query and not fulltext_regexes:
+        return None
+    if shutil.which("rg") is None:
+        return None
+
+    roots = [str(root) for _, root in source_roots if root.exists()]
+    if not roots:
+        return set()
+
+    def run_rg(args: list[str]) -> set[Path] | None:
+        try:
+            proc = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        # rg exit code: 0 match, 1 no match, 2 error
+        if proc.returncode not in {0, 1}:
+            return None
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        return {Path(line).resolve() for line in lines}
+
+    matched: set[Path] | None = None
+    if fulltext_query:
+        query_args = [
+            "rg",
+            "-l",
+            "-i",
+            "--fixed-strings",
+            "--search-zip",
+            fulltext_query,
+            *roots,
+        ]
+        query_set = run_rg(query_args)
+        if query_set is None:
+            return None
+        matched = query_set
+
+    if fulltext_regexes:
+        regex_args = ["rg", "-l", "-i", "--search-zip"]
+        for pattern in fulltext_regexes:
+            regex_args.extend(["-e", pattern.pattern])
+        regex_args.extend(roots)
+        regex_set = run_rg(regex_args)
+        if regex_set is None:
+            return None
+        matched = regex_set if matched is None else matched.intersection(regex_set)
+
+    return matched if matched is not None else set()
+
+
 def session_status(record: dict, now: datetime, running_window_seconds: int) -> str:
     if record["completed"]:
         return "completed"
@@ -351,18 +438,33 @@ def collect_sessions(
     include_untitled: bool,
     query: str | None,
     regexes: list[re.Pattern[str]],
+    fulltext_query: str | None,
+    fulltext_regexes: list[re.Pattern[str]],
     now: datetime,
     running_window_seconds: int,
 ) -> list[dict]:
     source_roots = build_source_roots(source)
     thread_names = load_thread_names(source_roots)
+    rg_matches = rg_file_matches(source_roots, fulltext_query, fulltext_regexes)
     records: list[dict] = []
     for source_name, path in iter_session_paths(source_roots):
+        path_resolved = path.resolve()
         record = session_info(path, source_name, thread_names=thread_names)
         if not include_untitled and record["title"] == "(untitled session)":
             continue
         if not matches_query(record, query, regexes):
             continue
+        if fulltext_query or fulltext_regexes:
+            if rg_matches is not None:
+                if path_resolved in rg_matches:
+                    pass
+                elif path.name.endswith(".jsonl.zst"):
+                    if not session_text_matches(path, fulltext_query, fulltext_regexes):
+                        continue
+                else:
+                    continue
+            elif not session_text_matches(path, fulltext_query, fulltext_regexes):
+                continue
         _, record["completed"] = tail_session_event(path)
         record["status"] = session_status(record, now, running_window_seconds)
         record["age"] = format_age(record["started_at"], now)
@@ -516,6 +618,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Case-insensitive regex match against title, preview, or session id. Repeatable.",
     )
     list_parser.add_argument(
+        "--fulltext",
+        help="Case-insensitive substring match against the full session event stream.",
+    )
+    list_parser.add_argument(
+        "--fulltext-regex",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Case-insensitive regex match against the full session event stream. Repeatable.",
+    )
+    list_parser.add_argument(
         "--status",
         action="append",
         choices=STATUS_CHOICES,
@@ -614,6 +727,13 @@ def run_list(args: argparse.Namespace) -> int:
         except re.error as exc:
             print(f"Invalid regex pattern {raw!r}: {exc}", file=sys.stderr)
             return 2
+    fulltext_regexes = []
+    for raw in args.fulltext_regex:
+        try:
+            fulltext_regexes.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            print(f"Invalid fulltext regex pattern {raw!r}: {exc}", file=sys.stderr)
+            return 2
 
     now = datetime.now(timezone.utc)
     records = collect_sessions(
@@ -621,6 +741,8 @@ def run_list(args: argparse.Namespace) -> int:
         include_untitled=args.include_untitled,
         query=args.query,
         regexes=regexes,
+        fulltext_query=args.fulltext,
+        fulltext_regexes=fulltext_regexes,
         now=now,
         running_window_seconds=args.running_window,
     )
