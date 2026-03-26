@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Scout"
+  short_description: "Inspect Codex sessions and rollout activity"
+  default_prompt: "Use $codex-session-scout to find active Codex sessions, inspect their status, or fetch recent events."
