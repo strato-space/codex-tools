@@ -13,7 +13,7 @@ def main() -> None:
         / "skills"
         / "codex-session-scout"
         / "scripts"
-        / "codex_session_scout.py"
+        / "codex-session-scout"
     )
     runpy.run_path(str(script), run_name="__main__")
 

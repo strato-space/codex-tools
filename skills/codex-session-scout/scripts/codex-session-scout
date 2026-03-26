@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""Inspect local Codex session history, live activity, and event streams."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import deque
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "2.0.0"
+
+DEFAULT_SESSIONS_DIR = "/root/.codex/sessions"
+DEFAULT_ARCHIVED_DIR = "/root/.codex/archived_sessions"
+SESSION_INDEX_FILE = "session_index.jsonl"
+
+UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}"
+)
+DURATION_RE = re.compile(r"^(?P<value>\d+)(?P<unit>[smhd])$")
+
+VALID_COLUMNS = ("live", "age", "status", "id", "path", "title")
+VIEW_COLUMNS = {
+    "summary": ("age", "title"),
+    "ops": ("live", "age", "status", "id", "title"),
+    "paths": ("live", "age", "status", "id", "path", "title"),
+}
+STATUS_ORDER = {"running": 0, "completed": 1, "stale": 2}
+SOURCE_CHOICES = ("live", "all")
+STATUS_CHOICES = tuple(STATUS_ORDER.keys())
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+@contextmanager
+def open_session_text(path: Path):
+    """Open a Codex session file as a text stream."""
+
+    name = path.name
+    if name.endswith(".jsonl.gz"):
+        f = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        try:
+            yield f
+        finally:
+            f.close()
+        return
+
+    if name.endswith(".jsonl.zst"):
+        proc = subprocess.Popen(
+            ["zstd", "-dc", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            assert proc.stdout is not None
+            yield proc.stdout
+        finally:
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            finally:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+        return
+
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        yield f
+
+
+def parse_iso(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def parse_duration(value: str) -> int:
+    match = DURATION_RE.fullmatch(value.strip().lower())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"Invalid duration {value!r}. Use Ns, Nm, Nh, or Nd."
+        )
+    return int(match.group("value")) * DURATION_UNITS[match.group("unit")]
+
+
+def parse_columns(value: str) -> tuple[str, ...]:
+    columns = []
+    for raw in value.split(","):
+        column = raw.strip().lower()
+        if not column:
+            continue
+        if column not in VALID_COLUMNS:
+            allowed = ", ".join(VALID_COLUMNS)
+            raise argparse.ArgumentTypeError(
+                f"Invalid column {column!r}. Allowed columns: {allowed}."
+            )
+        if column not in columns:
+            columns.append(column)
+    if not columns:
+        raise argparse.ArgumentTypeError("At least one column is required.")
+    return tuple(columns)
+
+
+def extract_id_from_filename(name: str) -> str:
+    match = UUID_RE.search(name)
+    if not match:
+        return ""
+    return match.group(0)
+
+
+def extract_title_from_message(message: str) -> str:
+    lines = [line.strip() for line in message.splitlines()]
+    for index, line in enumerate(lines):
+        if "My request for Codex" in line:
+            for candidate in lines[index + 1 :]:
+                if candidate:
+                    return candidate
+            return ""
+    for line in lines:
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def format_age(ts: datetime, now: datetime) -> str:
+    seconds = max(0, int((now - ts).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def truncate(text: str, max_len: int) -> str:
+    if max_len <= 0 or len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def build_source_roots(source: str) -> list[tuple[str, Path]]:
+    roots = [("live", Path(DEFAULT_SESSIONS_DIR))]
+    if source == "all":
+        roots.append(("archived", Path(DEFAULT_ARCHIVED_DIR)))
+    return roots
+
+
+def load_thread_names(source_roots: list[tuple[str, Path]]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    codex_homes = {str(root.resolve().parent) for _, root in source_roots}
+    for codex_home in codex_homes:
+        index_path = Path(codex_home) / SESSION_INDEX_FILE
+        if not index_path.exists():
+            continue
+        try:
+            with index_path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    thread_id = str(obj.get("id") or "").strip()
+                    thread_name = str(obj.get("thread_name") or "").strip()
+                    if thread_id and thread_name:
+                        names[thread_id] = thread_name
+        except OSError:
+            continue
+    return names
+
+
+def iter_session_paths(source_roots: list[tuple[str, Path]]):
+    patterns = ("*.jsonl", "*.jsonl.gz", "*.jsonl.zst")
+    for source_name, root in source_roots:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            for path in root.rglob(pattern):
+                if path.is_file():
+                    yield source_name, path
+
+
+def read_last_json_line(path: Path) -> str | None:
+    if path.name.endswith(".jsonl"):
+        try:
+            with path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                end = f.tell()
+                if end <= 0:
+                    return None
+
+                pos = end - 1
+                while pos >= 0:
+                    f.seek(pos)
+                    if f.read(1) not in {b"\n", b"\r"}:
+                        break
+                    pos -= 1
+
+                if pos < 0:
+                    return None
+
+                start = pos
+                while start >= 0:
+                    f.seek(start)
+                    if f.read(1) == b"\n":
+                        start += 1
+                        break
+                    start -= 1
+
+                if start < 0:
+                    start = 0
+
+                f.seek(start)
+                raw = f.read(pos - start + 1)
+        except OSError:
+            return None
+        return raw.decode("utf-8", errors="replace").strip() or None
+
+    tail = deque(maxlen=1)
+    try:
+        with open_session_text(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    tail.append(line)
+    except OSError:
+        return None
+    return tail[0] if tail else None
+
+
+def tail_session_event(path: Path) -> tuple[datetime | None, bool]:
+    raw = read_last_json_line(path)
+    if not raw:
+        return None, False
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None, False
+    payload = obj.get("payload") or {}
+    last_ts = parse_iso(obj.get("timestamp") or "")
+    completed = obj.get("type") == "event_msg" and payload.get("type") == "task_complete"
+    return last_ts, completed
+
+
+def session_info(
+    path: Path,
+    source_name: str,
+    thread_names: dict[str, str] | None = None,
+) -> dict:
+    started_at = None
+    session_id = ""
+    preview = ""
+    try:
+        with open_session_text(path) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "session_meta":
+                    payload = obj.get("payload") or {}
+                    if not session_id:
+                        session_id = (
+                            payload.get("id")
+                            or payload.get("session_id")
+                            or payload.get("sessionId")
+                            or ""
+                        )
+                    if not started_at:
+                        started_at = parse_iso(payload.get("timestamp") or obj.get("timestamp") or "")
+                elif obj.get("type") == "event_msg":
+                    payload = obj.get("payload") or {}
+                    if payload.get("type") == "user_message" and not preview:
+                        preview = extract_title_from_message(payload.get("message") or "")
+                if started_at and session_id and preview:
+                    break
+    except Exception:
+        pass
+
+    last_activity_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    if not started_at:
+        started_at = last_activity_at
+    if not session_id:
+        session_id = extract_id_from_filename(path.name)
+    thread_name = (thread_names or {}).get(session_id, "")
+    title = thread_name or preview or "(untitled session)"
+    return {
+        "id": session_id,
+        "title": title,
+        "thread_name": thread_name,
+        "preview": preview,
+        "source": source_name,
+        "path": path,
+        "started_at": started_at,
+        "last_activity_at": last_activity_at,
+        "completed": False,
+        "status": "stale",
+        "age": "",
+        "live_age": "",
+    }
+
+
+def matches_query(record: dict, query: str | None, regexes: list[re.Pattern[str]]) -> bool:
+    haystacks = (
+        record.get("title") or "",
+        record.get("thread_name") or "",
+        record.get("preview") or "",
+        record.get("id") or "",
+    )
+    if query:
+        query_norm = query.casefold()
+        if not any(text and query_norm in text.casefold() for text in haystacks):
+            return False
+    if regexes:
+        if not any(text and any(pattern.search(text) for pattern in regexes) for text in haystacks):
+            return False
+    return True
+
+
+def session_status(record: dict, now: datetime, running_window_seconds: int) -> str:
+    if record["completed"]:
+        return "completed"
+    if (now - record["last_activity_at"]).total_seconds() <= running_window_seconds:
+        return "running"
+    return "stale"
+
+
+def collect_sessions(
+    source: str,
+    include_untitled: bool,
+    query: str | None,
+    regexes: list[re.Pattern[str]],
+    now: datetime,
+    running_window_seconds: int,
+) -> list[dict]:
+    source_roots = build_source_roots(source)
+    thread_names = load_thread_names(source_roots)
+    records: list[dict] = []
+    for source_name, path in iter_session_paths(source_roots):
+        record = session_info(path, source_name, thread_names=thread_names)
+        if not include_untitled and record["title"] == "(untitled session)":
+            continue
+        if not matches_query(record, query, regexes):
+            continue
+        _, record["completed"] = tail_session_event(path)
+        record["status"] = session_status(record, now, running_window_seconds)
+        record["age"] = format_age(record["started_at"], now)
+        record["live_age"] = format_age(record["last_activity_at"], now)
+        records.append(record)
+    return records
+
+
+def sort_records(records: list[dict], sort_key: str) -> None:
+    if sort_key == "start":
+        records.sort(
+            key=lambda record: (
+                -(record["started_at"].timestamp()),
+                -(record["last_activity_at"].timestamp()),
+            )
+        )
+        return
+    records.sort(
+        key=lambda record: (
+            STATUS_ORDER[record["status"]],
+            -(record["last_activity_at"].timestamp()),
+            -(record["started_at"].timestamp()),
+        )
+    )
+
+
+def record_json(record: dict) -> dict:
+    return {
+        "id": record["id"],
+        "title": record["title"],
+        "thread_name": record["thread_name"],
+        "preview": record["preview"],
+        "status": record["status"],
+        "source": record["source"],
+        "age": record["age"],
+        "live_age": record["live_age"],
+        "started_at": record["started_at"].isoformat(),
+        "last_activity_at": record["last_activity_at"].isoformat(),
+        "path": str(record["path"]),
+    }
+
+
+def render_column(record: dict, column: str, max_title: int) -> str:
+    if column == "live":
+        return record["live_age"]
+    if column == "age":
+        return record["age"]
+    if column == "status":
+        return record["status"]
+    if column == "id":
+        return record["id"] or "-"
+    if column == "path":
+        return str(record["path"])
+    if column == "title":
+        return truncate(record["title"], max_title)
+    raise ValueError(f"Unknown column: {column}")
+
+
+def print_table(records: list[dict], columns: tuple[str, ...], max_title: int) -> None:
+    rows = [[render_column(record, column, max_title) for column in columns] for record in records]
+    widths = []
+    for index, column in enumerate(columns):
+        values = [row[index] for row in rows]
+        widths.append(max((len(value) for value in values), default=0))
+
+    right_aligned = {"live", "age"}
+    for row in rows:
+        formatted = []
+        for index, column in enumerate(columns):
+            value = row[index]
+            width = widths[index]
+            if column in right_aligned:
+                formatted.append(value.rjust(width))
+            else:
+                formatted.append(value.ljust(width) if column != "title" else value)
+        print("  ".join(formatted).rstrip())
+
+
+def print_tsv(records: list[dict], columns: tuple[str, ...], max_title: int) -> None:
+    for record in records:
+        print(
+            "\t".join(render_column(record, column, max_title) for column in columns)
+        )
+
+
+def find_session_by_id(source: str, session_id: str) -> Path | None:
+    source_roots = build_source_roots(source)
+    for _, path in iter_session_paths(source_roots):
+        if extract_id_from_filename(path.name) == session_id:
+            return path
+    thread_names = load_thread_names(source_roots)
+    for source_name, path in iter_session_paths(source_roots):
+        if session_info(path, source_name, thread_names=thread_names)["id"] == session_id:
+            return path
+    return None
+
+
+def fetch_session(path: Path, output_format: str) -> int:
+    if output_format == "jsonl":
+        with open_session_text(path) as f:
+            for line in f:
+                print(line.rstrip("\n"))
+        return 0
+
+    payload: list[object] = []
+    with open_session_text(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload.append(json.loads(line))
+            except Exception:
+                payload.append({"_raw": line})
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-session-scout",
+        description="Inspect local Codex session logs and live rollout activity.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser(
+        "list",
+        help="List sessions with explicit filtering, sorting, and column selection.",
+    )
+    list_parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default="live",
+        help="Read only live sessions or include archived sessions as well.",
+    )
+    list_parser.add_argument(
+        "--query",
+        help="Case-insensitive substring match against title, preview, or session id.",
+    )
+    list_parser.add_argument(
+        "--regex",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Case-insensitive regex match against title, preview, or session id. Repeatable.",
+    )
+    list_parser.add_argument(
+        "--status",
+        action="append",
+        choices=STATUS_CHOICES,
+        default=[],
+        help="Filter by derived status. Repeatable.",
+    )
+    list_parser.add_argument(
+        "--active-within",
+        type=parse_duration,
+        metavar="DURATION",
+        help="Only keep sessions with live activity within the given duration, for example 15m or 24h.",
+    )
+    list_parser.add_argument(
+        "--running-window",
+        type=parse_duration,
+        default=parse_duration("5m"),
+        metavar="DURATION",
+        help="Duration used to classify a session as running. Default: 5m.",
+    )
+    list_parser.add_argument(
+        "--include-untitled",
+        action="store_true",
+        help="Include sessions whose title could not be inferred.",
+    )
+    list_parser.add_argument(
+        "--sort",
+        choices=("live", "start"),
+        default="live",
+        help="Sort by live activity or start time.",
+    )
+    list_parser.add_argument(
+        "--view",
+        choices=tuple(VIEW_COLUMNS),
+        default="ops",
+        help="Column preset for table or TSV output.",
+    )
+    list_parser.add_argument(
+        "--columns",
+        type=parse_columns,
+        metavar="COLUMN_LIST",
+        help="Comma-separated column list that overrides --view.",
+    )
+    list_parser.add_argument(
+        "--format",
+        choices=("table", "tsv", "json"),
+        default="table",
+        help="Output format.",
+    )
+    list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of sessions to emit.",
+    )
+    list_parser.add_argument(
+        "--max-title",
+        type=int,
+        default=96,
+        help="Maximum rendered title length for table or TSV output.",
+    )
+    list_parser.set_defaults(func=run_list)
+
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Emit the raw event stream for a single session id.",
+    )
+    fetch_parser.add_argument("session_id", help="Session id to fetch.")
+    fetch_parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default="all",
+        help="Read only live sessions or include archived sessions as well.",
+    )
+    fetch_parser.add_argument(
+        "--format",
+        choices=("jsonl", "json"),
+        default="jsonl",
+        help="Output format for the fetched session.",
+    )
+    fetch_parser.set_defaults(func=run_fetch)
+    return parser
+
+
+def run_list(args: argparse.Namespace) -> int:
+    if args.limit < 0:
+        print("--limit must be zero or greater.", file=sys.stderr)
+        return 2
+    if args.max_title < 0:
+        print("--max-title must be zero or greater.", file=sys.stderr)
+        return 2
+
+    regexes = []
+    for raw in args.regex:
+        try:
+            regexes.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            print(f"Invalid regex pattern {raw!r}: {exc}", file=sys.stderr)
+            return 2
+
+    now = datetime.now(timezone.utc)
+    records = collect_sessions(
+        source=args.source,
+        include_untitled=args.include_untitled,
+        query=args.query,
+        regexes=regexes,
+        now=now,
+        running_window_seconds=args.running_window,
+    )
+
+    if args.status:
+        allowed = set(args.status)
+        records = [record for record in records if record["status"] in allowed]
+    if args.active_within is not None:
+        records = [
+            record
+            for record in records
+            if (now - record["last_activity_at"]).total_seconds() <= args.active_within
+        ]
+
+    sort_records(records, args.sort)
+    records = records[: args.limit]
+
+    if args.format == "json":
+        print(json.dumps([record_json(record) for record in records], ensure_ascii=False, indent=2))
+        return 0
+
+    columns = args.columns or VIEW_COLUMNS[args.view]
+    if args.format == "tsv":
+        print_tsv(records, columns, args.max_title)
+        return 0
+
+    print_table(records, columns, args.max_title)
+    return 0
+
+
+def run_fetch(args: argparse.Namespace) -> int:
+    path = find_session_by_id(args.source, args.session_id)
+    if not path:
+        print(f"Session id not found: {args.session_id}", file=sys.stderr)
+        return 1
+    return fetch_session(path, args.format)
+
+
+def exit_for_broken_stdout_pipe() -> int:
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return 0
+    try:
+        os.dup2(devnull_fd, sys.stdout.fileno())
+    except OSError:
+        pass
+    finally:
+        os.close(devnull_fd)
+    return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return exit_for_broken_stdout_pipe()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

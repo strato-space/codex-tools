@@ -19,36 +19,36 @@ Typical uses:
 Run the bundled tool directly:
 
 ```bash
-uv run ~/.agents/skills/codex-session-scout/scripts/codex_session_scout.py --today --ops --show-id
+uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout list --view ops --active-within 24h
 ```
 
 Filter by a title fragment or id:
 
 ```bash
-uv run ~/.agents/skills/codex-session-scout/scripts/codex_session_scout.py --today --ops build
+uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout list --query build --view ops
 ```
 
 Use regex matching:
 
 ```bash
-uv run ~/.agents/skills/codex-session-scout/scripts/codex_session_scout.py --match 'review|worker' --show-id
+uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout list --regex 'review|worker' --view ops
 ```
 
 Fetch one session:
 
 ```bash
-uv run ~/.agents/skills/codex-session-scout/scripts/codex_session_scout.py fetch <session-id>
+uv run ~/.agents/skills/codex-session-scout/scripts/codex-session-scout fetch <session-id>
 ```
 
 ## Workflow
 
-1. Start with `--today --ops --show-id` when the user wants a live operational view.
-2. Add a positional pattern or `--match` when the session list is noisy.
+1. Start with `list --view ops --active-within 24h` when the user wants a live operational view.
+2. Add `--query` or `--regex` when the session list is noisy.
 3. Use `fetch <session-id>` when the user asks what a session is doing or what it did last.
 4. Summarize the relevant recent events instead of dumping the entire log unless the user asks for raw output.
 
 ## Notes
 
-- `--today` means "live activity within the last 24 hours".
+- The public CLI uses dash-case command names and explicit subcommands.
 - The tool reads renamed thread names from `session_index.jsonl` when available.
 - The default data sources are `/root/.codex/sessions` and `/root/.codex/archived_sessions`.
