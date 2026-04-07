@@ -12,4 +12,5 @@
 ### CHANGES
 - Added `cwd` / `repo` columns and `--cwd`, `--cwd-regex`, `--repo`, `--repo-regex` filters to `skills/codex-session-scout/scripts/codex-session-scout`.
 - Added `session_index.jsonl`-backed recovery metadata for zero-byte and metadata-empty sessions; `fetch --format json` now returns a `session_recovery` payload for degraded cases.
+- Tightened recovery after review: full-text queries no longer leak index-only ghost sessions, and readable non-zero session files now keep returning their real event stream even when metadata is sparse.
 - Updated `README.md`, `skills/codex-session-scout/SKILL.md`, and `skills/codex-session-scout/agents/openai.yaml` to document cwd/repo-aware lookup and degraded-session recovery.

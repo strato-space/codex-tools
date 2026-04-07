@@ -11,7 +11,7 @@ It is built for the moments when the normal picker is too slow or too visual: fi
 - Reads renamed thread names from `session_index.jsonl`
 - Sorts active sessions to the top using recent file activity
 - Shows compact operational views with `live age`, `age`, derived `status`, and session `cwd` / repo context
-- Filters by substring or grep-style regex against thread name, preview, session id, cwd, or repo metadata
+- Filters by substring or grep-style regex against thread name, preview, or session id, with dedicated cwd/repo filters for workdir-aware lookup
 - Supports full-text and regex search inside the full JSONL session stream
 - Fetches the full JSONL or JSON payload for any session id
 - Recovers degraded sessions from `session_index.jsonl` when the backing `.jsonl` is zero-byte or metadata-empty

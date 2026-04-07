@@ -641,6 +641,8 @@ def collect_sessions(
             continue
         if not matches_query(record, query, regexes, cwd_query, cwd_regexes, repo_query, repo_regexes):
             continue
+        if fulltext_query or fulltext_regexes:
+            continue
         if status_filter == {"running"}:
             continue
         if status_filter is not None and record["status"] not in status_filter:
@@ -783,9 +785,9 @@ def fetch_session(path: Path, output_format: str, source: str = "all") -> int:
     index_entries = load_session_index_entries(source_roots)
     session_id = extract_id_from_filename(path.name)
     info = session_info(path, "live", index_entries=index_entries)
-    if info.get("recovery_kind") in {"zero_byte", "metadata_empty"}:
+    if info.get("recovery_kind") == "zero_byte":
         fallback = emit_recovery_payload(
-            info.get("recovery_kind") or "zero_byte",
+            "zero_byte",
             session_id,
             info.get("title") or "",
             info.get("cwd") or "",
