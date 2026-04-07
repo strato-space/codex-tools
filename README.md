@@ -10,10 +10,11 @@ It is built for the moments when the normal picker is too slow or too visual: fi
 - Optionally includes archived sessions from `~/.codex/archived_sessions`
 - Reads renamed thread names from `session_index.jsonl`
 - Sorts active sessions to the top using recent file activity
-- Shows compact operational views with `live age`, `age`, and derived `status`
-- Filters by substring or grep-style regex against thread name, preview, or session id
+- Shows compact operational views with `live age`, `age`, derived `status`, and session `cwd` / repo context
+- Filters by substring or grep-style regex against thread name, preview, session id, cwd, or repo metadata
 - Supports full-text and regex search inside the full JSONL session stream
 - Fetches the full JSONL or JSON payload for any session id
+- Recovers degraded sessions from `session_index.jsonl` when the backing `.jsonl` is zero-byte or metadata-empty
 
 ## CLI Design
 
@@ -56,6 +57,13 @@ Filter by partial thread name or id:
 ```bash
 uv run ./codex-session-scout list --query worker --view ops
 uv run ./codex-session-scout list --query 019d1234 --columns id,title
+```
+
+Filter by workdir/repo context:
+
+```bash
+uv run ./codex-session-scout list --view paths --cwd /home/strato-space/copilot
+uv run ./codex-session-scout list --columns live,age,status,id,cwd,repo,title --repo strato-space/copilot
 ```
 
 Use regex matching like `grep`:
@@ -117,7 +125,7 @@ This repository includes an installable Codex skill at:
 After installing the skill, Codex can use the tool to:
 
 - find active sessions
-- locate a session by title fragment or id
+- locate a session by title fragment, id, cwd, or repo
 - inspect recent activity
 - fetch a session and summarize the latest messages
 

@@ -11,12 +11,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.1.0"
+__version__ = "2.3.0"
 
 DEFAULT_SESSIONS_DIR = "/root/.codex/sessions"
 DEFAULT_ARCHIVED_DIR = "/root/.codex/archived_sessions"
@@ -31,11 +32,11 @@ UUID_RE = re.compile(
 )
 DURATION_RE = re.compile(r"^(?P<value>\d+)(?P<unit>[smhd])$")
 
-VALID_COLUMNS = ("live", "age", "status", "id", "path", "title")
+VALID_COLUMNS = ("live", "age", "status", "id", "cwd", "repo", "path", "title")
 VIEW_COLUMNS = {
     "summary": ("age", "title"),
-    "ops": ("live", "age", "status", "id", "title"),
-    "paths": ("live", "age", "status", "id", "path", "title"),
+    "ops": ("live", "age", "status", "id", "cwd", "title"),
+    "paths": ("live", "age", "status", "id", "cwd", "repo", "path", "title"),
 }
 STATUS_ORDER = {"running": 0, "completed": 1, "stale": 2}
 SOURCE_CHOICES = ("live", "all")
@@ -144,6 +145,48 @@ def extract_title_from_message(message: str) -> str:
     return ""
 
 
+def looks_like_local_path(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    return value.startswith("/") and len(value) > 1
+
+
+def find_path_hint(node: object) -> str:
+    if isinstance(node, dict):
+        for key in ("cwd", "workdir", "workspace", "project_path", "root_path"):
+            value = node.get(key)
+            if looks_like_local_path(value):
+                return str(value).strip()
+        for key, value in node.items():
+            key_norm = str(key).casefold()
+            if any(token in key_norm for token in ("cwd", "workdir", "workspace", "project", "root")) and looks_like_local_path(value):
+                return str(value).strip()
+        for value in node.values():
+            found = find_path_hint(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = find_path_hint(value)
+            if found:
+                return found
+    return ""
+
+
+def derive_repo_hint(cwd: str, git_meta: object) -> str:
+    if isinstance(git_meta, dict):
+        repo_url = str(git_meta.get("repository_url") or "").strip()
+        if repo_url:
+            return repo_url
+    if cwd:
+        current = Path(cwd)
+        for candidate in (current, *current.parents):
+            if (candidate / ".git").exists():
+                return str(candidate)
+    return ""
+
+
 def format_age(ts: datetime, now: datetime) -> str:
     seconds = max(0, int((now - ts).total_seconds()))
     if seconds < 60:
@@ -168,8 +211,8 @@ def build_source_roots(source: str) -> list[tuple[str, Path]]:
     return roots
 
 
-def load_thread_names(source_roots: list[tuple[str, Path]]) -> dict[str, str]:
-    names: dict[str, str] = {}
+def load_session_index_entries(source_roots: list[tuple[str, Path]]) -> dict[str, dict[str, str]]:
+    entries: dict[str, dict[str, str]] = {}
     codex_homes = {str(root.resolve().parent) for _, root in source_roots}
     for codex_home in codex_homes:
         index_path = Path(codex_home) / SESSION_INDEX_FILE
@@ -183,12 +226,15 @@ def load_thread_names(source_roots: list[tuple[str, Path]]) -> dict[str, str]:
                     except Exception:
                         continue
                     thread_id = str(obj.get("id") or "").strip()
-                    thread_name = str(obj.get("thread_name") or "").strip()
-                    if thread_id and thread_name:
-                        names[thread_id] = thread_name
+                    if not thread_id:
+                        continue
+                    entries[thread_id] = {
+                        "thread_name": str(obj.get("thread_name") or "").strip(),
+                        "updated_at": str(obj.get("updated_at") or "").strip(),
+                    }
         except OSError:
             continue
-    return names
+    return entries
 
 
 def iter_session_paths(source_roots: list[tuple[str, Path]]):
@@ -267,11 +313,13 @@ def tail_session_event(path: Path) -> tuple[datetime | None, bool]:
 def session_info(
     path: Path,
     source_name: str,
-    thread_names: dict[str, str] | None = None,
+    index_entries: dict[str, dict[str, str]] | None = None,
 ) -> dict:
     started_at = None
     session_id = ""
     preview = ""
+    cwd = ""
+    repo = ""
     try:
         with open_session_text(path) as f:
             for line in f:
@@ -279,8 +327,8 @@ def session_info(
                     obj = json.loads(line)
                 except Exception:
                     continue
+                payload = obj.get("payload") or {}
                 if obj.get("type") == "session_meta":
-                    payload = obj.get("payload") or {}
                     if not session_id:
                         session_id = (
                             payload.get("id")
@@ -290,27 +338,45 @@ def session_info(
                         )
                     if not started_at:
                         started_at = parse_iso(payload.get("timestamp") or obj.get("timestamp") or "")
+                    if not cwd:
+                        cwd = find_path_hint(payload)
+                    if not repo:
+                        repo = derive_repo_hint(cwd, payload.get("git"))
                 elif obj.get("type") == "event_msg":
-                    payload = obj.get("payload") or {}
                     if payload.get("type") == "user_message" and not preview:
                         preview = extract_title_from_message(payload.get("message") or "")
-                if started_at and session_id and preview:
+                    if not cwd:
+                        cwd = find_path_hint(payload)
+                    if not repo:
+                        repo = derive_repo_hint(cwd, payload.get("git"))
+                if started_at and session_id and preview and cwd and repo:
                     break
     except Exception:
         pass
 
     last_activity_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    if not started_at:
-        started_at = last_activity_at
     if not session_id:
         session_id = extract_id_from_filename(path.name)
-    thread_name = (thread_names or {}).get(session_id, "")
+    index_entry = (index_entries or {}).get(session_id, {})
+    index_updated_at = parse_iso(index_entry.get("updated_at") or "") if index_entry else None
+    if path.stat().st_size == 0 and index_updated_at is not None:
+        last_activity_at = index_updated_at
+    if not started_at:
+        started_at = index_updated_at or last_activity_at
+    thread_name = str(index_entry.get("thread_name") or "")
     title = thread_name or preview or "(untitled session)"
+    recovery_kind = ""
+    if path.stat().st_size == 0:
+        recovery_kind = "zero_byte"
+    elif thread_name and not preview and not cwd and not repo:
+        recovery_kind = "metadata_empty"
     return {
         "id": session_id,
         "title": title,
         "thread_name": thread_name,
         "preview": preview,
+        "cwd": cwd,
+        "repo": repo,
         "source": source_name,
         "path": path,
         "started_at": started_at,
@@ -319,16 +385,52 @@ def session_info(
         "status": "stale",
         "age": "",
         "live_age": "",
+        "recovery_kind": recovery_kind,
     }
 
 
-def matches_query(record: dict, query: str | None, regexes: list[re.Pattern[str]]) -> bool:
+def matches_query(
+    record: dict,
+    query: str | None,
+    regexes: list[re.Pattern[str]],
+    cwd_query: str | None,
+    cwd_regexes: list[re.Pattern[str]],
+    repo_query: str | None,
+    repo_regexes: list[re.Pattern[str]],
+) -> bool:
     haystacks = (
         record.get("title") or "",
         record.get("thread_name") or "",
         record.get("preview") or "",
         record.get("id") or "",
     )
+    cwd_value = record.get("cwd") or ""
+    repo_value = record.get("repo") or ""
+    if query:
+        query_norm = query.casefold()
+        if not any(text and query_norm in text.casefold() for text in haystacks):
+            return False
+    if regexes:
+        if not any(text and any(pattern.search(text) for pattern in regexes) for text in haystacks):
+            return False
+    if cwd_query and cwd_query.casefold() not in cwd_value.casefold():
+        return False
+    if cwd_regexes and not any(pattern.search(cwd_value) for pattern in cwd_regexes):
+        return False
+    if repo_query and repo_query.casefold() not in repo_value.casefold():
+        return False
+    if repo_regexes and not any(pattern.search(repo_value) for pattern in repo_regexes):
+        return False
+    return True
+
+
+def index_entry_matches(
+    session_id: str,
+    entry: dict[str, str],
+    query: str | None,
+    regexes: list[re.Pattern[str]],
+) -> bool:
+    haystacks = (session_id, str(entry.get("thread_name") or ""))
     if query:
         query_norm = query.casefold()
         if not any(text and query_norm in text.casefold() for text in haystacks):
@@ -337,6 +439,29 @@ def matches_query(record: dict, query: str | None, regexes: list[re.Pattern[str]
         if not any(text and any(pattern.search(text) for pattern in regexes) for text in haystacks):
             return False
     return True
+
+
+def build_index_only_record(session_id: str, entry: dict[str, str]) -> dict | None:
+    updated_at = parse_iso(entry.get("updated_at") or "")
+    if updated_at is None:
+        return None
+    return {
+        "id": session_id,
+        "title": str(entry.get("thread_name") or "") or "(untitled session)",
+        "thread_name": str(entry.get("thread_name") or ""),
+        "preview": "",
+        "cwd": "",
+        "repo": "",
+        "source": "index",
+        "path": None,
+        "started_at": updated_at,
+        "last_activity_at": updated_at,
+        "completed": False,
+        "status": "stale",
+        "age": "",
+        "live_age": "",
+        "recovery_kind": "index_only",
+    }
 
 
 def session_text_matches(
@@ -438,23 +563,47 @@ def collect_sessions(
     include_untitled: bool,
     query: str | None,
     regexes: list[re.Pattern[str]],
+    cwd_query: str | None,
+    cwd_regexes: list[re.Pattern[str]],
+    repo_query: str | None,
+    repo_regexes: list[re.Pattern[str]],
     fulltext_query: str | None,
     fulltext_regexes: list[re.Pattern[str]],
     now: datetime,
     running_window_seconds: int,
+    status_filter: set[str] | None = None,
+    active_within_seconds: int | None = None,
 ) -> list[dict]:
     source_roots = build_source_roots(source)
-    thread_names = load_thread_names(source_roots)
+    index_entries = load_session_index_entries(source_roots)
     rg_matches = rg_file_matches(source_roots, fulltext_query, fulltext_regexes)
+    indexed_candidate_ids: set[str] | None = None
+    query_rg_matches: set[Path] | None = None
+    if (query or regexes) and not any((cwd_query, cwd_regexes, repo_query, repo_regexes, fulltext_query, fulltext_regexes)):
+        matched_ids = {
+            session_id
+            for session_id, entry in index_entries.items()
+            if index_entry_matches(session_id, entry, query, regexes)
+        }
+        if matched_ids:
+            indexed_candidate_ids = matched_ids
+        query_rg_matches = rg_file_matches(source_roots, query, regexes)
     records: list[dict] = []
+    seen_ids: set[str] = set()
     for source_name, path in iter_session_paths(source_roots):
-        path_resolved = path.resolve()
-        record = session_info(path, source_name, thread_names=thread_names)
+        session_id_from_name = extract_id_from_filename(path.name)
+        if indexed_candidate_ids is not None and session_id_from_name:
+            if session_id_from_name in index_entries and session_id_from_name not in indexed_candidate_ids:
+                continue
+            if session_id_from_name not in index_entries and query_rg_matches is not None and path.resolve() not in query_rg_matches:
+                continue
+        record = session_info(path, source_name, index_entries=index_entries)
         if not include_untitled and record["title"] == "(untitled session)":
             continue
-        if not matches_query(record, query, regexes):
+        if not matches_query(record, query, regexes, cwd_query, cwd_regexes, repo_query, repo_regexes):
             continue
         if fulltext_query or fulltext_regexes:
+            path_resolved = path.resolve()
             if rg_matches is not None:
                 if path_resolved in rg_matches:
                     pass
@@ -467,6 +616,38 @@ def collect_sessions(
                 continue
         _, record["completed"] = tail_session_event(path)
         record["status"] = session_status(record, now, running_window_seconds)
+        live_seconds = (now - record["last_activity_at"]).total_seconds()
+        if active_within_seconds is not None and live_seconds > active_within_seconds:
+            continue
+        if status_filter == {"running"} and live_seconds > running_window_seconds:
+            continue
+        if status_filter is not None and record["status"] not in status_filter:
+            continue
+        record["age"] = format_age(record["started_at"], now)
+        record["live_age"] = format_age(record["last_activity_at"], now)
+        records.append(record)
+        if record["id"]:
+            seen_ids.add(record["id"])
+
+    for session_id, entry in index_entries.items():
+        if session_id in seen_ids:
+            continue
+        if indexed_candidate_ids is not None and session_id not in indexed_candidate_ids:
+            continue
+        record = build_index_only_record(session_id, entry)
+        if record is None:
+            continue
+        if not include_untitled and record["title"] == "(untitled session)":
+            continue
+        if not matches_query(record, query, regexes, cwd_query, cwd_regexes, repo_query, repo_regexes):
+            continue
+        if status_filter == {"running"}:
+            continue
+        if status_filter is not None and record["status"] not in status_filter:
+            continue
+        live_seconds = (now - record["last_activity_at"]).total_seconds()
+        if active_within_seconds is not None and live_seconds > active_within_seconds:
+            continue
         record["age"] = format_age(record["started_at"], now)
         record["live_age"] = format_age(record["last_activity_at"], now)
         records.append(record)
@@ -497,13 +678,16 @@ def record_json(record: dict) -> dict:
         "title": record["title"],
         "thread_name": record["thread_name"],
         "preview": record["preview"],
+        "cwd": record.get("cwd") or "",
+        "repo": record.get("repo") or "",
         "status": record["status"],
         "source": record["source"],
         "age": record["age"],
         "live_age": record["live_age"],
         "started_at": record["started_at"].isoformat(),
         "last_activity_at": record["last_activity_at"].isoformat(),
-        "path": str(record["path"]),
+        "path": str(record["path"]) if record.get("path") is not None else "",
+        "recovery_kind": record.get("recovery_kind") or "",
     }
 
 
@@ -516,8 +700,12 @@ def render_column(record: dict, column: str, max_title: int) -> str:
         return record["status"]
     if column == "id":
         return record["id"] or "-"
+    if column == "cwd":
+        return record.get("cwd") or "-"
+    if column == "repo":
+        return record.get("repo") or "-"
     if column == "path":
-        return str(record["path"])
+        return str(record["path"]) if record.get("path") is not None else "-"
     if column == "title":
         return truncate(record["title"], max_title)
     raise ValueError(f"Unknown column: {column}")
@@ -555,14 +743,61 @@ def find_session_by_id(source: str, session_id: str) -> Path | None:
     for _, path in iter_session_paths(source_roots):
         if extract_id_from_filename(path.name) == session_id:
             return path
-    thread_names = load_thread_names(source_roots)
+    index_entries = load_session_index_entries(source_roots)
     for source_name, path in iter_session_paths(source_roots):
-        if session_info(path, source_name, thread_names=thread_names)["id"] == session_id:
+        if session_info(path, source_name, index_entries=index_entries)["id"] == session_id:
             return path
     return None
 
 
-def fetch_session(path: Path, output_format: str) -> int:
+def index_only_session_by_id(source: str, session_id: str) -> dict | None:
+    source_roots = build_source_roots(source)
+    entry = load_session_index_entries(source_roots).get(session_id)
+    if not entry:
+        return None
+    return build_index_only_record(session_id, entry)
+
+
+def emit_recovery_payload(recovery_kind: str, session_id: str, title: str, cwd: str, repo: str, path: str) -> dict:
+    warning = {
+        "zero_byte": "Session file is zero-byte; showing index-backed metadata only.",
+        "metadata_empty": "Session file has no usable metadata; showing recovery metadata only.",
+        "index_only": "Session file is missing; showing session_index-backed metadata only.",
+    }.get(recovery_kind, "Showing recovery metadata only.")
+    return {
+        "type": "session_recovery",
+        "payload": {
+            "id": session_id,
+            "title": title,
+            "cwd": cwd,
+            "repo": repo,
+            "path": path,
+            "recovery_kind": recovery_kind,
+            "warning": warning,
+        },
+    }
+
+
+def fetch_session(path: Path, output_format: str, source: str = "all") -> int:
+    source_roots = build_source_roots(source)
+    index_entries = load_session_index_entries(source_roots)
+    session_id = extract_id_from_filename(path.name)
+    info = session_info(path, "live", index_entries=index_entries)
+    if info.get("recovery_kind") in {"zero_byte", "metadata_empty"}:
+        fallback = emit_recovery_payload(
+            info.get("recovery_kind") or "zero_byte",
+            session_id,
+            info.get("title") or "",
+            info.get("cwd") or "",
+            info.get("repo") or "",
+            str(path),
+        )
+        if output_format == "jsonl":
+            print(json.dumps(fallback, ensure_ascii=False))
+            return 0
+        print(json.dumps([fallback], ensure_ascii=False, indent=2))
+        return 0
+
     if output_format == "jsonl":
         with open_session_text(path) as f:
             for line in f:
@@ -581,6 +816,55 @@ def fetch_session(path: Path, output_format: str) -> int:
                 payload.append({"_raw": line})
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
+
+
+def emit_stream_line(line: str, output_format: str) -> None:
+    line = line.rstrip("\n")
+    if output_format == "jsonl":
+        print(line, flush=True)
+        return
+    raw = line.strip()
+    if not raw:
+        return
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        obj = {"_raw": raw}
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def follow_session(
+    path: Path,
+    output_format: str,
+    since_start: bool,
+    poll_interval: float,
+) -> int:
+    if path.name.endswith(".jsonl.gz") or path.name.endswith(".jsonl.zst"):
+        print(
+            "Streaming follow is supported only for live .jsonl files. "
+            "Use `fetch` + polling for compressed sessions.",
+            file=sys.stderr,
+        )
+        return 2
+    if poll_interval <= 0:
+        print("--poll-interval must be greater than 0.", file=sys.stderr)
+        return 2
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            if not since_start:
+                f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if line:
+                    emit_stream_line(line, output_format)
+                    continue
+                time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        return 0
+    except OSError as exc:
+        print(f"Failed to follow session file: {exc}", file=sys.stderr)
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -616,6 +900,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="PATTERN",
         help="Case-insensitive regex match against title, preview, or session id. Repeatable.",
+    )
+    list_parser.add_argument(
+        "--cwd",
+        help="Case-insensitive substring match against session cwd/workdir metadata.",
+    )
+    list_parser.add_argument(
+        "--cwd-regex",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Case-insensitive regex match against session cwd/workdir metadata. Repeatable.",
+    )
+    list_parser.add_argument(
+        "--repo",
+        help="Case-insensitive substring match against derived repo metadata.",
+    )
+    list_parser.add_argument(
+        "--repo-regex",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="Case-insensitive regex match against derived repo metadata. Repeatable.",
     )
     list_parser.add_argument(
         "--fulltext",
@@ -709,6 +1015,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format for the fetched session.",
     )
     fetch_parser.set_defaults(func=run_fetch)
+
+    follow_parser = subparsers.add_parser(
+        "follow",
+        help="Stream new events for a session id (tail -f style).",
+    )
+    follow_parser.add_argument("session_id", help="Session id to follow.")
+    follow_parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default="live",
+        help="Read only live sessions or include archived sessions as well.",
+    )
+    follow_parser.add_argument(
+        "--format",
+        choices=("jsonl", "json"),
+        default="jsonl",
+        help="Output format for streamed events.",
+    )
+    follow_parser.add_argument(
+        "--since-start",
+        action="store_true",
+        help="Stream from the beginning of the file instead of only new events.",
+    )
+    follow_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.25,
+        metavar="SECONDS",
+        help="Polling interval for new lines. Default: 0.25 seconds.",
+    )
+    follow_parser.set_defaults(func=run_follow)
     return parser
 
 
@@ -734,17 +1071,38 @@ def run_list(args: argparse.Namespace) -> int:
         except re.error as exc:
             print(f"Invalid fulltext regex pattern {raw!r}: {exc}", file=sys.stderr)
             return 2
+    cwd_regexes = []
+    for raw in args.cwd_regex:
+        try:
+            cwd_regexes.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            print(f"Invalid cwd regex pattern {raw!r}: {exc}", file=sys.stderr)
+            return 2
+    repo_regexes = []
+    for raw in args.repo_regex:
+        try:
+            repo_regexes.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            print(f"Invalid repo regex pattern {raw!r}: {exc}", file=sys.stderr)
+            return 2
 
     now = datetime.now(timezone.utc)
+    status_filter = set(args.status) if args.status else None
     records = collect_sessions(
         source=args.source,
         include_untitled=args.include_untitled,
         query=args.query,
         regexes=regexes,
+        cwd_query=args.cwd,
+        cwd_regexes=cwd_regexes,
+        repo_query=args.repo,
+        repo_regexes=repo_regexes,
         fulltext_query=args.fulltext,
         fulltext_regexes=fulltext_regexes,
         now=now,
         running_window_seconds=args.running_window,
+        status_filter=status_filter,
+        active_within_seconds=args.active_within,
     )
 
     if args.status:
@@ -775,10 +1133,38 @@ def run_list(args: argparse.Namespace) -> int:
 
 def run_fetch(args: argparse.Namespace) -> int:
     path = find_session_by_id(args.source, args.session_id)
+    if path:
+        return fetch_session(path, args.format, source=args.source)
+    record = index_only_session_by_id(args.source, args.session_id)
+    if not record:
+        print(f"Session id not found: {args.session_id}", file=sys.stderr)
+        return 1
+    fallback = emit_recovery_payload(
+        "index_only",
+        record.get("id") or args.session_id,
+        record.get("title") or "",
+        record.get("cwd") or "",
+        record.get("repo") or "",
+        "",
+    )
+    if args.format == "jsonl":
+        print(json.dumps(fallback, ensure_ascii=False))
+        return 0
+    print(json.dumps([fallback], ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_follow(args: argparse.Namespace) -> int:
+    path = find_session_by_id(args.source, args.session_id)
     if not path:
         print(f"Session id not found: {args.session_id}", file=sys.stderr)
         return 1
-    return fetch_session(path, args.format)
+    return follow_session(
+        path=path,
+        output_format=args.format,
+        since_start=args.since_start,
+        poll_interval=args.poll_interval,
+    )
 
 
 def exit_for_broken_stdout_pipe() -> int:
